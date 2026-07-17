@@ -35,6 +35,20 @@ const ALLOWED = new Set([
 let cooldown = {};
 let rr = 0;
 
+// ── Path normalization ─────────────────────────────────────────────────────
+// Bulletproof routing: accept /v1/chat/completions, /chat/completions, with
+// trailing slashes, double slashes, and case variations. Many clients (ZCode,
+// OpenCode) build paths differently — this accepts them all.
+function normalizePath(pathname) {
+  // Collapse multiple slashes, lowercase, strip trailing slash (keep root).
+  let p = pathname.replace(/\/+/g, '/').toLowerCase();
+  if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+  // Optionally strip a leading /v1 so /v1/x and /x both route to x.
+  if (p.startsWith('/v1/')) p = p.slice(3); // -> "/chat/completions"
+  else if (p === '/v1') p = '/';
+  return p;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 function getKeys(env) {
   const keys = [];
@@ -48,8 +62,20 @@ function getKeys(env) {
 function jsonErr(status, message) {
   return new Response(JSON.stringify({ error: { message, type: 'error' } }), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: corsHeaders({ 'Content-Type': 'application/json' }),
   });
+}
+
+// CORS: allow all so any browser/client can call the proxy.
+function corsHeaders(extra = {}) {
+  return Object.assign(
+    {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': '*',
+    },
+    extra
+  );
 }
 
 function checkAuth(authHeader, token) {
@@ -83,12 +109,9 @@ function buildPayload(body) {
   body = filtered;
 
   // 4. Strip top-level (OpenAI) reasoning_effort — NIM rejects it.
-  //    NOTE: chat_template_kwargs.reasoning_effort is DIFFERENT (GLM-specific)
-  //    and is set below. Only strip the top-level one here.
   delete body.reasoning_effort;
 
   // 5. GLM/Gemma thinking: enable_thinking ON, reasoning_effort="max", NO cap.
-  //    User wants deepest thinking; time doesn't matter.
   const model = (body.model || '').toLowerCase();
   if (model.includes('glm') || model.includes('gemma')) {
     let ctk = body.chat_template_kwargs;
@@ -139,7 +162,7 @@ async function postWithRotation(url, payload, accept, env) {
         Authorization: 'Bearer ' + e.key,
         'Content-Type': 'application/json',
         Accept: accept,
-        'Accept-Encoding': 'identity', // no compression — stream token-by-token
+        'Accept-Encoding': 'identity',
       };
       let resp;
       try {
@@ -176,13 +199,11 @@ async function postWithRotation(url, payload, accept, env) {
           detail = 'HTTP ' + status;
         }
         if (detail.toUpperCase().includes('DEGRADED')) {
-          // Transient NVIDIA overload — retry next key.
           lastStatus = status;
           lastDetail = detail;
           transient = true;
           continue;
         }
-        // Real client error — surface immediately.
         return { error: jsonErr(status, detail) };
       } else {
         return { response: resp };
@@ -206,35 +227,49 @@ async function postWithRotation(url, payload, accept, env) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const path = url.pathname;
+    const path = normalizePath(url.pathname);
+    const method = request.method;
 
-    // GET /health
-    if (path === '/health' && request.method === 'GET') {
-      return Response.json({ status: 'ok', keys: getKeys(env).length });
+    // CORS preflight — answer immediately.
+    if (method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    // GET /models
-    if (path === '/models' && request.method === 'GET') {
-      return Response.json({
-        models: [
-          { id: 'z-ai/glm-5.2', name: 'GLM-5.2', context: 1000000, note: 'Flagship. Max thinking. 1M context.' },
-          { id: 'google/diffusiongemma-26b-a4b-it', name: 'DiffusionGemma-26B', context: 256000, note: 'Fast MoE. Thinking ON.' },
-        ],
-      });
+    // GET /health (also /v1/health)
+    if (path === '/health' && method === 'GET') {
+      return Response.json({ status: 'ok', keys: getKeys(env).length }, { headers: corsHeaders() });
     }
 
-    // GET /  (minimal dashboard / status text)
-    if (path === '/' && request.method === 'GET') {
+    // GET /models (also /v1/models)
+    if (path === '/models' && method === 'GET') {
+      return Response.json(
+        {
+          object: 'list',
+          data: [
+            { id: 'z-ai/glm-5.2', object: 'model', owned_by: 'z-ai' },
+            { id: 'google/diffusiongemma-26b-a4b-it', object: 'model', owned_by: 'google' },
+          ],
+          models: [
+            { id: 'z-ai/glm-5.2', name: 'GLM-5.2', context: 1000000, note: 'Flagship. Max thinking. 1M context.' },
+            { id: 'google/diffusiongemma-26b-a4b-it', name: 'DiffusionGemma-26B', context: 256000, note: 'Fast MoE. Thinking ON.' },
+          ],
+        },
+        { headers: corsHeaders() }
+      );
+    }
+
+    // GET / (root — minimal status text)
+    if (path === '/' && method === 'GET') {
       return new Response(
         'NVIDIA NIM Proxy — Cloudflare Worker\n\n' +
           'Endpoints:\n  POST /v1/chat/completions\n  GET  /health\n  GET  /models\n\n' +
           'Keys configured: ' + getKeys(env).length,
-        { headers: { 'Content-Type': 'text/plain; charset=utf-8' } }
+        { headers: corsHeaders({ 'Content-Type': 'text/plain; charset=utf-8' }) }
       );
     }
 
-    // POST /v1/chat/completions
-    if (path === '/v1/chat/completions' && request.method === 'POST') {
+    // POST /v1/chat/completions (also /chat/completions, /v1/chat/completions/, etc.)
+    if (path === '/chat/completions' && method === 'POST') {
       const authErr = checkAuth(request.headers.get('authorization'), env.PROXY_AUTH_TOKEN);
       if (authErr) return authErr;
 
@@ -252,14 +287,10 @@ export default {
       const accept = isStream ? 'text/event-stream' : 'application/json';
 
       // ── Streaming: immediate keepalive byte BEFORE the NVIDIA request ──
-      // The client gets a byte instantly (so it never "didn't even connect"),
-      // then we start the request and pump chunks, with ping every 2s during
-      // GLM's long thinking phase.
       if (isStream) {
         const enc = new TextEncoder();
         const stream = new ReadableStream({
           async start(controller) {
-            // Immediate first byte
             controller.enqueue(enc.encode(': proxy-connected\n\n'));
 
             let stopped = false;
@@ -274,14 +305,8 @@ export default {
             }, 2000);
 
             try {
-              const result = await postWithRotation(
-                NVIDIA_URL + '/chat/completions',
-                payload,
-                accept,
-                env
-              );
+              const result = await postWithRotation(NVIDIA_URL + '/chat/completions', payload, accept, env);
               if (result.error) {
-                // Forward the error as an SSE data line so the client can parse it.
                 const errBody = await result.error.text();
                 try {
                   controller.enqueue(enc.encode('data: ' + errBody + '\n\n'));
@@ -295,16 +320,16 @@ export default {
                 if (done) break;
                 if (!firstByte) {
                   firstByte = true;
-                  stopped = true; // real data flowing — stop pinging
+                  stopped = true;
                 }
                 try {
                   controller.enqueue(value);
                 } catch {
-                  break; // client gone
+                  break;
                 }
               }
             } catch {
-              // swallow — stream just ends
+              // swallow
             } finally {
               stopped = true;
               clearInterval(ping);
@@ -313,17 +338,15 @@ export default {
               } catch {}
             }
           },
-          cancel() {
-            // client disconnected — nothing extra to clean (finally handles it)
-          },
+          cancel() {},
         });
 
         return new Response(stream, {
-          headers: {
+          headers: corsHeaders({
             'Content-Type': 'text/event-stream; charset=utf-8',
             'Cache-Control': 'no-cache, no-transform',
             Connection: 'keep-alive',
-          },
+          }),
         });
       }
 
@@ -332,9 +355,10 @@ export default {
       if (result.error) return result.error;
       const text = await result.response.text();
       const ct = result.response.headers.get('content-type') || 'application/json';
-      return new Response(text, { headers: { 'Content-Type': ct } });
+      return new Response(text, { headers: corsHeaders({ 'Content-Type': ct }) });
     }
 
-    return jsonErr(404, 'Not found. Use /v1/chat/completions, /health, or /models.');
+    // Helpful 404 that lists valid routes.
+    return jsonErr(404, "Not found. Use POST /v1/chat/completions, GET /health, or GET /models. (path was: " + path + ")");
   },
 };
