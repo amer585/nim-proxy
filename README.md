@@ -1,46 +1,46 @@
----
-title: Nvidia NIM Proxy
-emoji: 🚀
-colorFrom: blue
-colorTo: green
-sdk: docker
-app_port: 7860
-pinned: false
----
+# NVIDIA NIM Proxy — Cloudflare Worker
 
-# NVIDIA NIM Proxy
+OpenAI-compatible proxy → NVIDIA NIM (`https://integrate.api.nvidia.com/v1`) for **GLM-5.2 (max thinking)** + DiffusionGemma.
 
-OpenAI-compatible proxy in front of NVIDIA NIM (`https://integrate.api.nvidia.com/v1`)
-with multi-key rotation and automatic GLM reasoning-parameter injection.
+## Deploy
+
+```bash
+npm install
+npx wrangler login          # one-time
+npx wrangler deploy
+```
+
+## Set secrets
+
+```bash
+npx wrangler secret put PROXY_AUTH_TOKEN
+npx wrangler secret put NVIDIA_KEY_1
+npx wrangler secret put NVIDIA_KEY_2
+npx wrangler secret put NVIDIA_KEY_3
+npx wrangler secret put NVIDIA_KEY_4
+```
+Or via the dashboard: **Workers & Pages → nim-proxy → Settings → Variables and Secrets → Add**.
 
 ## Endpoints
 
 | Method | Path | Description |
-| ------ | ---- | ----------- |
-| GET | `/health` | `{"status":"ok"}` |
-| POST | `/v1/chat/completions` | OpenAI-compatible chat (streaming SSE). Generic passthrough for any text model (GLM, etc.). |
+|---|---|---|
+| POST | `/v1/chat/completions` | OpenAI-compatible chat (streaming SSE) |
+| GET | `/health` | `{"status":"ok","keys":4}` |
+| GET | `/models` | JSON model list |
 
-## Required Space secrets
+## Use with any OpenAI client (ZCode/OpenCode)
 
-Set these in the Space **Settings → Variables and secrets** page (as *secrets*):
+- **Base URL:** `https://nim-proxy.<your-subdomain>.workers.dev/v1`
+- **API key:** your `PROXY_AUTH_TOKEN`
+- **Model:** `z-ai/glm-5.2`
 
-- `NVIDIA_KEY_1`, `NVIDIA_KEY_2`, `NVIDIA_KEY_3`, `NVIDIA_KEY_4`
-- `PROXY_AUTH_TOKEN` (the bearer token your client must send)
+## What the proxy does
 
-## Behavior
+- GLM-5.2: `enable_thinking=true` + `reasoning_effort="max"` (deepest thinking, NO cap)
+- Whitelist param filtering (strips `reasoning_effort`, `parallel_tool_calls`, `store`, etc. — NVIDIA rejects them)
+- `max_tokens` floored to 202000 (prevents null-content when thinking eats all tokens)
+- Multi-key rotation (NVIDIA_KEY_1–8), 15-min cooldown on 429, retry-with-backoff for DEGRADED
+- Streaming: **immediate keepalive byte** + ping every 2s (prevents client timeouts during GLM's long thinking)
 
-- Forwards the exact OpenAI request body to NVIDIA NIM.
-- Streams responses chunk-by-chunk (no buffering).
-- Rotates across the 4 NVIDIA keys; on HTTP 429 it retries the next key and
-  cool-downs the offending key for 15 minutes.
-- For any model whose name contains `glm`, it injects
-  `chat_template_kwargs: {"enable_thinking": true}` at the **root** of the body
-  (NVIDIA NIM rejects the `extra_body` wrapper).
-- Requires `Authorization: Bearer <PROXY_AUTH_TOKEN>`; otherwise returns 401.
-
-## Run locally
-
-```bash
-pip install -r requirements.txt
-NVIDIA_KEY_1=... PROXY_AUTH_TOKEN=... uvicorn main:app --host 0.0.0.0 --port 7860
-```
+See `HANDOFF.md` for full architecture + troubleshooting.

@@ -1,0 +1,12 @@
+name = "nim-proxy"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+# Secrets (set via `wrangler secret put ...` or the Cloudflare dashboard):
+#   PROXY_AUTH_TOKEN   — your bearer token (clients send it)
+#   NVIDIA_KEY_1       — NVIDIA API key 1
+#   NVIDIA_KEY_2       — NVIDIA API key 2
+#   NVIDIA_KEY_3       — NVIDIA API key 3
+#   NVIDIA_KEY_4       — NVIDIA API key 4
+#
+# No plaintext secrets here — they are injected at runtime as env bindings.
